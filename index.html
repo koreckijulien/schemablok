@@ -256,10 +256,33 @@ const FUNCS = NP({
 
 class SimError extends Error { constructor(msg, ids) { super(msg); this.ids = ids || []; } }
 
-function compileExpr(src) {
+function matrixValue(value) {
+  if (!Array.isArray(value) || !value.length) throw new Error('vecteur ou matrice vide');
+  if (!Array.isArray(value[0])) return value.map(v => [v]);
+  if (!value[0].length || value.some(row => !Array.isArray(row) || row.length !== value[0].length)) throw new Error('matrice irrégulière');
+  return value;
+}
+function vectorOp(op, a, b) {
+  const aa = Array.isArray(a), bb = Array.isArray(b);
+  if (!aa && !bb) return op === '+' ? a + b : op === '-' ? a - b : op === '*' ? a * b : a / b;
+  if (op === '*' && aa && bb) {
+    const A = matrixValue(a), B = matrixValue(b);
+    if (A[0].length !== B.length) throw new Error('dimensions incompatibles pour le produit matriciel');
+    const result = A.map(row => B[0].map((_, j) => row.reduce((sum, v, k) => sum + v * B[k][j], 0)));
+    return Array.isArray(b[0]) ? result : result.map(row => row[0]);
+  }
+  if ((op === '*' || op === '/') && aa && !bb) return a.map(v => Array.isArray(v) ? v.map(x => op === '*' ? x * b : x / b) : op === '*' ? v * b : v / b);
+  if (op === '*' && !aa && bb) return vectorOp('*', b, a);
+  if ((op === '+' || op === '-') && aa && bb) {
+    if (a.length !== b.length || a.some((v, i) => Array.isArray(v) !== Array.isArray(b[i]))) throw new Error('dimensions incompatibles');
+    return a.map((v, i) => Array.isArray(v) ? vectorOp(op, v, b[i]) : op === '+' ? v + b[i] : v - b[i]);
+  }
+  throw new Error('opération incompatible avec un vecteur ou une matrice');
+}
+function compileExpr(src, vectorMode = false) {
   const s = String(src == null ? '' : src);
   if (!s.trim()) throw new Error('valeur manquante');
-  const re = /\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([A-Za-z_][A-Za-z_0-9]*)|(<=|>=|==|!=|~=|&&|\|\||[-+*\/^%()<>,!~]))/y;
+  const re = /\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|([A-Za-z_][A-Za-z_0-9]*)|(<=|>=|==|!=|~=|&&|\|\||[-+*\/^%()<>,!~\[\];]))/y;
   const toks = []; let i = 0;
   while (i < s.length) {
     re.lastIndex = i; const m = re.exec(s);
@@ -270,22 +293,48 @@ function compileExpr(src) {
     i = re.lastIndex;
   }
   let p = 0;
+  const scalar = v => { if (typeof v !== 'number') throw new Error('un scalaire est attendu'); return v; };
   const eat = v => { const k = toks[p]; if (k && k.t === 'op' && k.v === v) { p++; return true; } return false; };
   function primary() {
     const k = toks[p++]; if (!k) throw new Error('expression incomplète');
     if (k.t === 'num') { const v = k.v; return () => v; }
+    if (vectorMode && k.t === 'op' && k.v === '[') {
+      const rows = [];
+      do {
+        const row = [or()];
+        while (eat(',')) row.push(or());
+        rows.push(row);
+      } while (eat(';'));
+      if (!eat(']')) throw new Error('crochet fermant manquant');
+      if (rows.some(row => row.length !== rows[0].length)) throw new Error('lignes de longueurs différentes');
+      return env => {
+        const values = rows.map(row => row.map(f => f(env)));
+        if (values.some(row => row.some(v => typeof v !== 'number'))) throw new Error('les éléments d’une matrice doivent être scalaires');
+        return values.length === 1 ? values[0] : values;
+      };
+    }
     if (k.t === 'id') {
       const name = k.v;
       if (eat('(')) {
         const args = [];
         if (!eat(')')) { do { args.push(or()); } while (eat(',')); if (!eat(')')) throw new Error('parenthèse fermante manquante'); }
         const f = FUNCS[name]; if (!f) throw new Error('fonction inconnue : ' + name);
-        if (args.length === 1) { const a = args[0]; return env => f(a(env)); }
-        if (args.length === 2) { const a = args[0], b = args[1]; return env => f(a(env), b(env)); }
-        return env => f(...args.map(a => a(env)));
+        if (args.length === 1) { const a = args[0]; return env => f(vectorMode ? scalar(a(env)) : a(env)); }
+        if (args.length === 2) { const a = args[0], b = args[1]; return env => f(vectorMode ? scalar(a(env)) : a(env), vectorMode ? scalar(b(env)) : b(env)); }
+        return env => f(...args.map(a => vectorMode ? scalar(a(env)) : a(env)));
       }
+      const index = vectorMode && eat('[') ? or() : null;
+      if (index && !eat(']')) throw new Error('crochet fermant manquant');
       return env => {
-        const v = env[name]; if (typeof v === 'number') return v;
+        let v = env[name];
+        if (vectorMode && Array.isArray(v) && Array.isArray(v[0]) && v.length === 1) v = v[0];
+        else if (vectorMode && Array.isArray(v) && Array.isArray(v[0]) && v.every(row => row.length === 1)) v = v.map(row => row[0]);
+        if (index) {
+          const i = index(env);
+          if (!Array.isArray(v) || Array.isArray(v[0]) || !Number.isInteger(i) || i < 1 || i > v.length) throw new Error('indice de vecteur invalide pour ' + name);
+          return v[i - 1];
+        }
+        if (typeof v === 'number' || (vectorMode && Array.isArray(v))) return v;
         if (name in CONSTS) return CONSTS[name];
         throw new Error(v === undefined ? 'variable inconnue : ' + name : name + ' n’est pas un scalaire');
       };
@@ -293,11 +342,11 @@ function compileExpr(src) {
     if (k.t === 'op' && k.v === '(') { const e = or(); if (!eat(')')) throw new Error('parenthèse fermante manquante'); return e; }
     throw new Error('symbole inattendu « ' + k.v + ' »');
   }
-  function pow() { const b = primary(); if (eat('^')) { const x = unary(); return env => Math.pow(b(env), x(env)); } return b; }
+  function pow() { const b = primary(); if (eat('^')) { const x = unary(); return env => Math.pow(vectorMode ? scalar(b(env)) : b(env), vectorMode ? scalar(x(env)) : x(env)); } return b; }
   function unary() {
-    if (eat('-')) { const a = unary(); return env => -a(env); }
+    if (eat('-')) { const a = unary(); return env => vectorMode ? vectorOp('*', -1, a(env)) : -a(env); }
     if (eat('+')) return unary();
-    if (eat('!') || eat('~')) { const a = unary(); return env => (a(env) ? 0 : 1); }
+    if (eat('!') || eat('~')) { const a = unary(); return env => ((vectorMode ? scalar(a(env)) : a(env)) ? 0 : 1); }
     return pow();
   }
   const bin = (next, ops) => function () {
@@ -307,11 +356,12 @@ function compileExpr(src) {
       p++; const b = next(), f = ops[k.v], l = a; a = env => f(l(env), b(env));
     }
   };
-  const mul = bin(unary, NP({ '*': (a, b) => a * b, '/': (a, b) => a / b, '%': (a, b) => a % b }));
-  const add = bin(mul, NP({ '+': (a, b) => a + b, '-': (a, b) => a - b }));
-  const cmp = bin(add, NP({ '<': (a, b) => +(a < b), '>': (a, b) => +(a > b), '<=': (a, b) => +(a <= b), '>=': (a, b) => +(a >= b), '==': (a, b) => +(a === b), '!=': (a, b) => +(a !== b), '~=': (a, b) => +(a !== b) }));
-  const and = bin(cmp, NP({ '&&': (a, b) => +(a && b ? 1 : 0) }));
-  const or = bin(and, NP({ '||': (a, b) => +(a || b ? 1 : 0) }));
+  const mul = bin(unary, NP({ '*': (a, b) => vectorMode ? vectorOp('*', a, b) : a * b, '/': (a, b) => vectorMode ? vectorOp('/', a, b) : a / b, '%': (a, b) => vectorMode ? scalar(a) % scalar(b) : a % b }));
+  const add = bin(mul, NP({ '+': (a, b) => vectorMode ? vectorOp('+', a, b) : a + b, '-': (a, b) => vectorMode ? vectorOp('-', a, b) : a - b }));
+  const scalarOp = f => (a, b) => f(vectorMode ? scalar(a) : a, vectorMode ? scalar(b) : b);
+  const cmp = bin(add, NP({ '<': scalarOp((a, b) => +(a < b)), '>': scalarOp((a, b) => +(a > b)), '<=': scalarOp((a, b) => +(a <= b)), '>=': scalarOp((a, b) => +(a >= b)), '==': scalarOp((a, b) => +(a === b)), '!=': scalarOp((a, b) => +(a !== b)), '~=': scalarOp((a, b) => +(a !== b)) }));
+  const and = bin(cmp, NP({ '&&': scalarOp((a, b) => +(a && b ? 1 : 0)) }));
+  const or = bin(and, NP({ '||': scalarOp((a, b) => +(a || b ? 1 : 0)) }));
   const root = or();
   if (p < toks.length) throw new Error('symbole inattendu « ' + toks[p].v + ' »');
   return root;
@@ -422,7 +472,7 @@ const TYPES = {
   /* Sources */
   const: { cat: 'src', label: 'Constante', nin: 0, nout: 1, autoW: 1, desc: 'Délivre une valeur constante.',
     params: [{ k: 'v', label: 'Valeur', def: '1' }], icon: P => P.v,
-    make(g) { const v = g.n('v'); return { out: () => v }; } },
+    make(g) { const m = g.m('v'); if (!m.length || !m[0].length || (m.length > 1 && m[0].length > 1)) throw new Error('la constante doit être un scalaire ou un vecteur'); const v = m.length === 1 ? m[0] : m.map(row => row[0]); if (v.some(x => !Number.isFinite(x))) throw new Error('la constante doit être finie'); return { out: () => v.length === 1 ? v[0] : v }; } },
   step: { cat: 'src', label: 'Échelon', nin: 0, nout: 1, glyph: 'M-14 8H0V-8H14', desc: 'Passe de la valeur initiale à la valeur finale à l’instant indiqué.',
     params: [{ k: 't0', label: 'Instant de l’échelon (s)', def: '1' }, { k: 'y0', label: 'Valeur initiale', def: '0' }, { k: 'y1', label: 'Valeur finale', def: '1' }],
     make(g) { const ts = g.n('t0'), y0 = g.n('y0'), y1 = g.n('y1'), e = tol(ts);
@@ -526,11 +576,17 @@ const TYPES = {
   mathfn: { cat: 'math', label: 'Fonction usuelle', w: 70, nin: 1, nout: 1, desc: 'Applique une fonction mathématique à l’entrée.',
     params: [{ k: 'f', label: 'Fonction', def: 'sin', opts: Object.keys(MATHFN) }], icon: P => (/u/.test(P.f) ? P.f : P.f + '(u)'),
     make(g) { const f = MATHFN[g.s('f')]; if (!f) throw new Error('fonction inconnue'); return { ft: true, out: (t, X, o, u) => f(u[0]) }; } },
-  fcn: { cat: 'math', label: 'Expression', w: 80, nin: P => clampInt(P.n, 1, 6), nout: 1, autoW: 1, desc: 'Expression libre des entrées u1, u2, … et du temps t. Opérateurs + − * / ^, comparaisons, fonctions sin, exp, sqrt, min, max, etc.',
-    params: [{ k: 'n', label: 'Nombre d’entrées', def: '1' }, { k: 'expr', label: 'Expression', def: 'u1^2' }], icon: P => P.expr,
-    make(g) { const f = compileExpr(g.s('expr')), env = Object.create(g.env), n = clampInt(g.s('n'), 1, 6);
-      env.t = 0; env.u = 0; for (let j = 0; j < n; j++) env['u' + (j + 1)] = 0; f(env);
-      return { ft: true, out(t, X, o, u) { env.t = t; env.u = u[0]; for (let j = 0; j < n; j++) env['u' + (j + 1)] = u[j]; return f(env); } }; } },
+  mux: { cat: 'math', label: 'Multiplexeur', w: 60, nin: P => clampInt(P.n, 1, 8), nout: 1, desc: 'Regroupe les entrées scalaires dans un vecteur, dans l’ordre des ports.',
+    params: [{ k: 'n', label: 'Nombre d’entrées', def: '3' }], icon: () => 'Mux',
+    make() { return { ft: true, out: (t, X, o, u) => [...u] }; } },
+  demux: { cat: 'math', label: 'Démultiplexeur', w: 70, nin: 1, nout: P => clampInt(P.n, 1, 8), desc: 'Sépare un vecteur en sorties scalaires. Le nombre de sorties doit correspondre à sa longueur.',
+    params: [{ k: 'n', label: 'Nombre de sorties', def: '3' }], icon: () => 'Demux',
+    make(g) { const n = clampInt(g.s('n'), 1, 8); return { ft: true, vectorInputs: true, multiout: true, out(t, X, o, u) { if (!Array.isArray(u[0]) || u[0].length !== n) throw new Error('vecteur attendu de longueur ' + n); return [...u[0]]; } }; } },
+  fcn: { cat: 'math', label: 'Expression', w: 80, nin: P => clampInt(P.n, 1, 6), nout: 1, autoW: 1, desc: 'Expression des entrées u1, u2, … et du temps t. En mode vectoriel : [a,b;c,d]*u1, u1[1], coefficients dynamiques et vecteurs.',
+    params: [{ k: 'n', label: 'Nombre d’entrées', def: '1' }, { k: 'mode', label: 'Mode', def: 'scalaire', opts: ['scalaire', 'vectoriel'] }, { k: 'expr', label: 'Expression', def: 'u1^2' }], icon: P => P.expr,
+    make(g) { const vector = g.s('mode') === 'vectoriel', f = compileExpr(g.s('expr'), vector), env = Object.create(g.env), n = clampInt(g.s('n'), 1, 6);
+      env.t = 0; env.u = 0; for (let j = 0; j < n; j++) env['u' + (j + 1)] = 0; if (!vector) f(env);
+      return { ft: true, vectorInputs: vector, out(t, X, o, u) { env.t = t; env.u = u[0]; for (let j = 0; j < n; j++) env['u' + (j + 1)] = u[j]; return f(env); } }; } },
   relop: { cat: 'math', label: 'Comparateur', w: 50, nin: 2, nout: 1, desc: 'Vaut 1 si la comparaison entre l’entrée 1 et l’entrée 2 est vraie, 0 sinon.',
     params: [{ k: 'op', label: 'Opérateur', def: '≥', opts: Object.keys(RELOP) }], icon: P => P.op,
     make(g) { const f = RELOP[g.s('op')]; if (!f) throw new Error('opérateur inconnu'); return { ft: true, out: (t, X, o, u) => (f(u[0], u[1]) ? 1 : 0) }; } },
@@ -558,8 +614,13 @@ const TYPES = {
   /* Visualisation */
   scope: { cat: 'sink', label: 'Oscilloscope', nin: P => clampInt(P.n, 1, 8), nout: 0, glyph: 'M-13 -9h26v18h-26zM-10 4q4 -14 8 -4t10 -4', desc: 'Trace ses entrées en fonction du temps dans le panneau du bas.',
     params: [{ k: 'n', label: 'Nombre d’entrées', def: '1' }],
-    make(g) { const n = clampInt(g.s('n'), 1, 8), T = [], Y = Array.from({ length: n }, () => []);
-      return { sink: true, T, Y, log(t, u) { T.push(t); for (let j = 0; j < n; j++) Y[j].push(u[j]); } }; } },
+    make(g) { const n = clampInt(g.s('n'), 1, 8), T = [], Y = [], widths = [];
+      return { sink: true, vectorInputs: true, T, Y, widths, log(t, u) {
+        const values = u.map(v => Array.isArray(v) ? v : [v]);
+        if (!T.length) { values.forEach(v => widths.push(v.length)); for (const v of values) for (const _ of v) Y.push([]); }
+        if (values.some((v, j) => v.length !== widths[j])) throw new Error('la taille d’une entrée a changé pendant la simulation');
+        T.push(t); let j = 0; for (const v of values) for (const x of v) Y[j++].push(x);
+      } }; } },
   xy: { cat: 'sink', label: 'Graphe XY', nin: 2, nout: 0, glyph: 'M-12 -10V10H12M8 0A6 5 0 1 1 -4 0A6 5 0 1 1 8 0', desc: 'Trace l’entrée 2 en fonction de l’entrée 1 (plan de phase).',
     params: [], make() { const T = [], Y = [[], []]; return { sink: true, T, Y, log(t, u) { T.push(t); Y[0].push(u[0]); Y[1].push(u[1]); } }; } },
   display: { cat: 'sink', label: 'Afficheur', w: 80, nin: 1, nout: 0, desc: 'Affiche la valeur finale de son entrée.',
@@ -567,6 +628,7 @@ const TYPES = {
 };
 const CATS = [['src', 'Sources'], ['cont', 'Continu'], ['disc', 'Discret'], ['math', 'Opérations'], ['nl', 'Non linéaire'], ['sink', 'Visualisation']];
 const nIn = b => { const n = TYPES[b.type].nin; return typeof n === 'function' ? n(b.params) : n; };
+const nOut = b => { const n = TYPES[b.type].nout; return typeof n === 'function' ? n(b.params) : n; };
 const defaults = type => { const o = {}; TYPES[type].params.forEach(p => (o[p.k] = p.def)); return o; };
 
 function makeInstance(b, env) {
@@ -586,10 +648,10 @@ function compileModel(model) {
   model.blocks.forEach((b, i) => idx.set(b.id, i));
   const B = model.blocks.map(b => {
     let inst; try { inst = makeInstance(b, env); } catch (e) { throw new SimError(b.name + ' : ' + e.message, [b.id]); }
-    inst.id = b.id; inst.name = b.name; inst.nin = nIn(b); inst.src = new Int32Array(inst.nin).fill(-1); inst.u = new Float64Array(inst.nin);
+    inst.id = b.id; inst.name = b.name; inst.nin = nIn(b); inst.nout = nOut(b); inst.src = new Int32Array(inst.nin).fill(-1); inst.srcPort = new Int32Array(inst.nin); inst.u = new Array(inst.nin).fill(0);
     inst.nx = inst.nx || 0; return inst;
   });
-  for (const w of model.wires) { const s = idx.get(w.from), d = idx.get(w.to); if (s === undefined || d === undefined || w.port >= B[d].nin) continue; B[d].src[w.port] = s; }
+  for (const w of model.wires) { const s = idx.get(w.from), d = idx.get(w.to), p = w.fromPort == null ? 0 : w.fromPort; if (s === undefined || d === undefined || !Number.isInteger(w.port) || w.port < 0 || w.port >= B[d].nin || !Number.isInteger(p) || p < 0 || p >= B[s].nout) continue; B[d].src[w.port] = s; B[d].srcPort[w.port] = p; }
   let nx = 0; const X0 = [];
   B.forEach(b => { b.o = nx; nx += b.nx; if (b.nx) X0.push(...b.x0); for (let j = 0; j < b.nin; j++) if (b.src[j] < 0) warnings.push(b.name + ' : entrée ' + (j + 1) + ' non connectée (prise égale à 0).'); });
   const n = B.length, indeg = new Int32Array(n), succ = B.map(() => []);
@@ -620,16 +682,22 @@ function createSim(model) {
   for (const b of B) if (b.hmax) hmax = Math.min(hmax, b.hmax);
   if (fixed && tf / hf > 5e6) throw new SimError('Pas fixe trop petit pour cette durée (plus de 5 millions de pas).');
   const X = Float64Array.from(C.X0), Xn = new Float64Array(nx), Xt = new Float64Array(nx), K = Array.from({ length: 7 }, () => new Float64Array(nx));
-  const sig = new Float64Array(B.length), c = { major: false, inStep: false, t0: 0 };
+  const sig = B.map(b => new Array(b.nout).fill(0)), c = { major: false, inStep: false, t0: 0 };
   const stateful = B.filter(b => b.nx), sinks = B.filter(b => b.sink), upds = B.filter(b => b.upd), brks = B.filter(b => b.brk), outs = order.filter(k => B[k].out);
-  const gather = b => { const u = b.u, s = b.src; for (let j = 0; j < u.length; j++) u[j] = s[j] < 0 ? 0 : sig[s[j]]; return u; };
-  function outputs(t, X) { for (let i = 0; i < outs.length; i++) { const k = outs[i], b = B[k]; sig[k] = b.out(t, X, b.o, gather(b), c); } }
+  const gather = (b, validate = true) => { const u = b.u, s = b.src; for (let j = 0; j < u.length; j++) { u[j] = s[j] < 0 ? 0 : sig[s[j]][b.srcPort[j]]; if (validate && !b.vectorInputs && Array.isArray(u[j])) throw new SimError(b.name + ' : l’entrée ' + (j + 1) + ' attend un scalaire ; utilisez un démultiplexeur.', [b.id]); } return u; };
+  const validNumber = v => typeof v === 'number' && (!c.major || Number.isFinite(v));
+  const validSignal = v => typeof v === 'number' ? validNumber(v) : Array.isArray(v) && v.length > 0 && v.every(validNumber);
+  function outputs(t, X) { for (let i = 0; i < outs.length; i++) { const k = outs[i], b = B[k]; let value;
+    try { value = b.out(t, X, b.o, gather(b, !!b.ft), c); } catch (e) { if (e instanceof SimError) throw e; throw new SimError(b.name + ' : ' + e.message + ' à t = ' + fmtNum(t) + ' s.', [b.id]); }
+    const values = b.multiout ? value : [value];
+    if (!Array.isArray(values) || values.length !== b.nout || values.some(v => !validSignal(v))) throw new SimError(b.name + ' produit un signal invalide ou non fini à t = ' + fmtNum(t) + ' s.', [b.id]);
+    sig[k] = values;
+  } }
   function f(t, X, dX) { outputs(t, X); for (const b of stateful) b.der(t, X, b.o, gather(b), dX); }
-  const logAll = t => { for (const b of sinks) b.log(t, gather(b)); };
+  const logAll = t => { for (const b of sinks) { try { b.log(t, gather(b)); } catch (e) { if (e instanceof SimError) throw e; throw new SimError(b.name + ' : ' + e.message + ' à t = ' + fmtNum(t) + ' s.', [b.id]); } } };
   function major(t) {
     c.major = true; c.inStep = false; outputs(t, X); logAll(t);
     for (const b of upds) b.upd(t, gather(b), c); c.major = false;
-    for (let k = 0; k < sig.length; k++) if (!Number.isFinite(sig[k]) && B[k].out) throw new SimError(B[k].name + ' produit une valeur non finie à t = ' + fmtNum(t) + ' s.', [B[k].id]);
   }
   const brk = t => { let m = Infinity; for (const b of brks) { const v = b.brk(t); if (v < m) m = v; } return m; };
   const axpy = (h, ks, ws) => { for (let i = 0; i < nx; i++) { let s = 0; for (let j = 0; j < ks.length; j++) s += ws[j] * ks[j][i]; Xt[i] = X[i] + h * s; } };
@@ -675,7 +743,7 @@ function createSim(model) {
       while (t < tf) { advance(); if (steps > 5e6) throw new SimError('Simulation interrompue après 5 millions de pas.'); if ((++n & 255) === 0 && Date.now() > end) return false; }
       return true;
     },
-    results() { const r = {}; for (const b of sinks) r[b.id] = { T: b.T, Y: b.Y, last: b.last }; return r; }
+    results() { const r = {}; for (const b of sinks) r[b.id] = { T: b.T, Y: b.Y, widths: b.widths, last: b.last }; return r; }
   };
 }
 </script>
@@ -724,21 +792,33 @@ const EXAMPLES = {
   'Échantillonnage et retard': () => mk([
     ['a', 'sine', 40, 40, { w: '2*pi*0.5' }, 'Signal'], ['z', 'zoh', 180, 100, { Ts: 'Ts' }, 'Bloqueur'], ['u', 'udelay', 300, 160, { Ts: 'Ts' }, 'Retard'],
     ['sc', 'scope', 460, 40, { n: '3' }, 'Comparaison']],
-    ['a>z', 'z>u', 'a>sc', 'z>sc:1', 'u>sc:2'], { tf: '4' }, 'Ts = 0.2   % période d’échantillonnage (s)')
+    ['a>z', 'z>u', 'a>sc', 'z>sc:1', 'u>sc:2'], { tf: '4' }, 'Ts = 0.2   % période d’échantillonnage (s)'),
+  'Transformation de Park': () => {
+    const m = mk([
+      ['a', 'sine', 40, 20, { w: 'omega' }, 'Phase a'], ['b', 'sine', 40, 100, { w: 'omega', phi: '-2*pi/3' }, 'Phase b'],
+      ['c', 'sine', 40, 180, { w: 'omega', phi: '2*pi/3' }, 'Phase c'], ['mux', 'mux', 160, 80, {}, 'abc'],
+      ['theta', 'ramp', 160, 240, { a: 'omega' }, 'Angle θ'],
+      ['park', 'fcn', 280, 100, { n: '2', mode: 'vectoriel', expr: '(2/3)*[cos(u2),cos(u2-2*pi/3),cos(u2+2*pi/3);-sin(u2),-sin(u2-2*pi/3),-sin(u2+2*pi/3);1/2,1/2,1/2]*u1' }, 'Park'],
+      ['demux', 'demux', 540, 100, {}, 'dq0'], ['sc', 'scope', 670, 100, { n: '3' }, 'Composantes d, q, 0']],
+    ['a>mux', 'b>mux:1', 'c>mux:2', 'mux>park', 'theta>park:1', 'park>demux'],
+    { tf: '2' }, 'omega = 2*pi   % pulsation électrique (rad/s)');
+    for (let j = 0; j < 3; j++) m.wires.push({ from: 'demux', fromPort: j, to: 'sc', port: j });
+    return m;
+  }
 };
 
 /* ---------- géométrie ---------- */
 function iconOf(b) { const d = TYPES[b.type]; if (!d.icon) return null; try { return d.icon(b.params); } catch (e) { return '?'; } }
 function blockSize(b) {
-  const d = TYPES[b.type], n = nIn(b); let w = d.w || 60, h = d.h || 40;
+  const d = TYPES[b.type], n = Math.max(nIn(b), nOut(b)); let w = d.w || 60, h = d.h || 40;
   if (d.autoW) { const ic = iconOf(b); const L = Math.max(...[].concat(ic || '').map(s => String(s).length)); w = Math.min(220, Math.max(w, Math.ceil((L * 7.4 + (d.shape === 'tri' ? 44 : 22)) / 20) * 20)); }
   if (n >= 2) h = 20 * (n + 1);
   return { w, h };
 }
 function inPos(b, j) { const s = blockSize(b), n = nIn(b); return { x: b.flip ? b.x + s.w : b.x, y: b.y + (n >= 2 ? 20 * (j + 1) : s.h / 2) }; }
-function outPos(b) { const s = blockSize(b); return { x: b.flip ? b.x : b.x + s.w, y: b.y + s.h / 2 }; }
+function outPos(b, j = 0) { const s = blockSize(b), n = nOut(b); return { x: b.flip ? b.x : b.x + s.w, y: b.y + (n >= 2 ? 20 * (j + 1) : s.h / 2) }; }
 function route(w) {
-  const A = byId(w.from), B = byId(w.to), p1 = outPos(A), p2 = inPos(B, w.port), s1 = A.flip ? -1 : 1, s2 = B.flip ? -1 : 1;
+  const A = byId(w.from), B = byId(w.to), p1 = outPos(A, w.fromPort || 0), p2 = inPos(B, w.port), s1 = A.flip ? -1 : 1, s2 = B.flip ? -1 : 1;
   const a = p1.x + s1 * 16, b = p2.x - s2 * (14 + 10 * w.port), sa = blockSize(A), sb = blockSize(B);
   if (s1 === s2) {
     if (s1 * (p2.x - p1.x) >= 24) { const m = Math.round((p1.x + p2.x) / 20) * 10; return [[p1.x, p1.y], [m, p1.y], [m, p2.y], [p2.x, p2.y]]; }
@@ -799,7 +879,7 @@ function render() {
     const s = blockSize(b), d = TYPES[b.type];
     bl += `<g class="blk${sel.has(b.id) ? ' sel' : ''}${badIds.has(b.id) ? ' bad' : ''}" data-block="${b.id}" transform="translate(${b.x} ${b.y})">${blockInner(b, s)}<text class="nm" x="${s.w / 2}" y="${s.h + 14}">${esc(b.name)}</text></g>`;
     for (let j = 0; j < nIn(b); j++) { const p = inPos(b, j); if (!fed.has(b.id + ':' + j)) pt += `<circle class="port in" cx="${p.x}" cy="${p.y}" r="3.5"/>`; pt += `<circle class="port-hit" data-port="in" data-b="${b.id}" data-j="${j}" cx="${p.x}" cy="${p.y}" r="9"/>`; }
-    if (d.nout) { const p = outPos(b); pt += `<circle class="port out" cx="${p.x}" cy="${p.y}" r="2.6"/><circle class="port-hit" data-port="out" data-b="${b.id}" cx="${p.x}" cy="${p.y}" r="9"/>`; }
+    for (let j = 0; j < nOut(b); j++) { const p = outPos(b, j); pt += `<circle class="port out" cx="${p.x}" cy="${p.y}" r="2.6"/><circle class="port-hit" data-port="out" data-b="${b.id}" data-j="${j}" cx="${p.x}" cy="${p.y}" r="9"/>`; }
   }
   $('gw').innerHTML = w; $('gb').innerHTML = bl; $('gp').innerHTML = pt;
   $('bUndo').disabled = !undo.length; $('bRedo').disabled = !redo.length;
@@ -812,7 +892,7 @@ function refreshEnv() { const ws = evalWorkspace(M.workspace); ICON_ENV = ws.env
 function save() { try { localStorage.setItem(KEY, JSON.stringify(M)); } catch (e) {} }
 function pushUndo() { undo.push(JSON.stringify(M)); if (undo.length > 100) undo.shift(); redo = []; }
 function changed() { pruneWires(); render(); renderDockPanels(); save(); }
-function pruneWires() { M.wires = M.wires.filter(w => { const a = byId(w.from), b = byId(w.to); return a && b && TYPES[a.type].nout && w.port < nIn(b); }); if (selWire >= M.wires.length) selWire = -1; }
+function pruneWires() { M.wires = M.wires.filter(w => { const a = byId(w.from), b = byId(w.to), p = w.fromPort == null ? 0 : w.fromPort; return a && b && Number.isInteger(p) && p >= 0 && p < nOut(a) && Number.isInteger(w.port) && w.port >= 0 && w.port < nIn(b); }); if (selWire >= M.wires.length) selWire = -1; }
 function restore(json) { M = normalize(JSON.parse(json)); sel.clear(); selWire = -1; badIds.clear(); refreshEnv(); syncSim(); changed(); renderInspector(); }
 function doUndo() { if (!undo.length) return; redo.push(JSON.stringify(M)); restore(undo.pop()); }
 function doRedo() { if (!redo.length) return; undo.push(JSON.stringify(M)); restore(redo.pop()); }
@@ -823,7 +903,7 @@ function normalize(m) {
     if (!TYPES[b.type] || ids.has(b.id)) continue; ids.add(String(b.id));
     blocks.push({ id: String(b.id), type: b.type, x: +b.x || 0, y: +b.y || 0, flip: !!b.flip, name: String(b.name || TYPES[b.type].label), params: Object.assign(defaults(b.type), b.params || {}) });
   }
-  const wires = (m.wires || []).filter(w => ids.has(String(w.from)) && ids.has(String(w.to))).map(w => ({ from: String(w.from), to: String(w.to), port: +w.port || 0 }));
+  const wires = (m.wires || []).filter(w => ids.has(String(w.from)) && ids.has(String(w.to))).map(w => ({ from: String(w.from), to: String(w.to), port: +w.port || 0, fromPort: +w.fromPort || 0 }));
   return { blocks, wires, sim: Object.assign(defaultSim(), m.sim || {}), workspace: String(m.workspace || '') };
 }
 function newId() { let i = M.blocks.length + 1; while (byId('b' + i)) i++; return 'b' + i; }
@@ -834,9 +914,9 @@ function addBlock(type, x, y) {
   b.x = Math.round((x - s.w / 2) / 10) * 10; b.y = Math.round((y - s.h / 2) / 10) * 10;
   M.blocks.push(b); sel = new Set([b.id]); selWire = -1; changed(); renderInspector(); return b;
 }
-function connect(from, to, port) {
-  const a = byId(from), b = byId(to); if (!a || !b || !TYPES[a.type].nout || port >= nIn(b)) return;
-  pushUndo(); M.wires = M.wires.filter(w => !(w.to === to && w.port === port)); M.wires.push({ from, to, port }); changed();
+function connect(from, to, port, fromPort = 0) {
+  const a = byId(from), b = byId(to); if (!a || !b || !Number.isInteger(fromPort) || fromPort < 0 || fromPort >= nOut(a) || !Number.isInteger(port) || port < 0 || port >= nIn(b)) return;
+  pushUndo(); M.wires = M.wires.filter(w => !(w.to === to && w.port === port)); M.wires.push({ from, to, port, fromPort }); changed();
 }
 function delSel() {
   if (!sel.size && selWire < 0) return; pushUndo();
@@ -848,7 +928,7 @@ function copySel() { if (!sel.size) return; clip = JSON.stringify({ blocks: M.bl
 function paste() {
   if (!clip) return; pushUndo(); const c = JSON.parse(clip), map = {}; sel.clear();
   for (const b of c.blocks) { const id = newId(); map[b.id] = id; M.blocks.push(Object.assign(b, { id, x: b.x + 30, y: b.y + 30, name: uniqueName(b.name) })); sel.add(id); }
-  for (const w of c.wires) M.wires.push({ from: map[w.from], to: map[w.to], port: w.port });
+  for (const w of c.wires) M.wires.push({ from: map[w.from], to: map[w.to], port: w.port, fromPort: w.fromPort || 0 });
   clip = JSON.stringify({ blocks: M.blocks.filter(b => sel.has(b.id)), wires: M.wires.filter(w => sel.has(w.from) && sel.has(w.to)) });
   selWire = -1; changed(); renderInspector();
 }
@@ -936,9 +1016,9 @@ svg.addEventListener('pointerdown', e => {
   if (e.button === 1 || e.button === 2 || spaceDown || (e.pointerType === 'touch' && !port && !be && !we)) { drag = { type: 'pan', sx: e.clientX, sy: e.clientY, vx: view.x, vy: view.y }; return; }
   if (port) {
     const id = port.dataset.b;
-    if (port.dataset.port === 'out') drag = { type: 'wire', from: id };
+    if (port.dataset.port === 'out') drag = { type: 'wire', from: id, fromPort: +port.dataset.j };
     else { const j = +port.dataset.j, i = M.wires.findIndex(w => w.to === id && w.port === j);
-      if (i >= 0) { pushUndo(); const w = M.wires.splice(i, 1)[0]; selWire = -1; drag = { type: 'wire', from: w.from, detached: true }; render(); }
+      if (i >= 0) { pushUndo(); const w = M.wires.splice(i, 1)[0]; selWire = -1; drag = { type: 'wire', from: w.from, fromPort: w.fromPort || 0, detached: true }; render(); }
       else drag = { type: 'wire', to: id, port: j }; }
     drag.P = P; drawTmp(); return;
   }
@@ -966,7 +1046,7 @@ svg.addEventListener('pointermove', e => {
 });
 function drawTmp() {
   const d = drag; let a, b;
-  if (d.from) { a = outPos(byId(d.from)); b = d.P; } else { a = d.P; b = inPos(byId(d.to), d.port); }
+  if (d.from) { a = outPos(byId(d.from), d.fromPort); b = d.P; } else { a = d.P; b = inPos(byId(d.to), d.port); }
   const m = (a.x + b.x) / 2; $('tmpw').setAttribute('d', `M${a.x} ${a.y}C${m} ${a.y} ${m} ${b.y} ${b.x} ${b.y}`);
 }
 function endDrag(e) {
@@ -976,11 +1056,11 @@ function endDrag(e) {
     $('tmpw').setAttribute('d', '');
     const el = document.elementFromPoint(e.clientX, e.clientY), port = el && el.closest('[data-port]'), be = el && el.closest('[data-block]');
     if (d.from) {
-      if (port && port.dataset.port === 'in') connect(d.from, port.dataset.b, +port.dataset.j);
-      else if (be) { const b = byId(be.dataset.block); let j = 0; while (j < nIn(b) && M.wires.some(w => w.to === b.id && w.port === j)) j++; if (j < nIn(b)) connect(d.from, b.id, j); else if (d.detached) changed(); }
+      if (port && port.dataset.port === 'in') connect(d.from, port.dataset.b, +port.dataset.j, d.fromPort);
+      else if (be) { const b = byId(be.dataset.block); let j = 0; while (j < nIn(b) && M.wires.some(w => w.to === b.id && w.port === j)) j++; if (j < nIn(b)) connect(d.from, b.id, j, d.fromPort); else if (d.detached) changed(); }
       else if (d.detached) changed();
-    } else if (port && port.dataset.port === 'out') connect(port.dataset.b, d.to, d.port);
-    else if (be && TYPES[byId(be.dataset.block).type].nout) connect(be.dataset.block, d.to, d.port);
+    } else if (port && port.dataset.port === 'out') connect(port.dataset.b, d.to, d.port, +port.dataset.j);
+    else if (be && nOut(byId(be.dataset.block)) === 1) connect(be.dataset.block, d.to, d.port);
   }
   else if (d.type === 'band') {
     const b = $('band'); b.setAttribute('width', 0); b.setAttribute('height', 0);
@@ -1047,7 +1127,16 @@ function finish(sim) {
 }
 
 /* ---------- traceur ---------- */
-function seriesNames(b) { return Array.from({ length: nIn(b) }, (_, j) => { const w = M.wires.find(w => w.to === b.id && w.port === j), s = w && byId(w.from); return s ? s.name : 'entrée ' + (j + 1); }); }
+function seriesNames(b) {
+  const widths = results[b.id] && results[b.id].widths;
+  return Array.from({ length: nIn(b) }, (_, j) => {
+    const w = M.wires.find(w => w.to === b.id && w.port === j), s = w && byId(w.from);
+    const name = s ? s.name + (nOut(s) > 1 ? ' · sortie ' + ((w.fromPort || 0) + 1) : '') : 'entrée ' + (j + 1);
+    const width = widths && widths.length === nIn(b) ? widths[j] : 1;
+    return Array.from({ length: width }, (_, k) => width > 1 ? name + '[' + (k + 1) + ']' : name);
+  }).flat();
+}
+const seriesColor = j => '--s' + (j % 8 + 1);
 function renderDockPanels() {
   const plots = M.blocks.filter(b => b.type === 'scope' || b.type === 'xy');
   if (!plots.some(b => b.id === activePlot)) activePlot = plots.length ? plots[0].id : null;
@@ -1055,7 +1144,7 @@ function renderDockPanels() {
   $('scopeList').innerHTML = plots.length ? plots.map(b => {
     const names = seriesNames(b), legend = b.type === 'xy'
       ? `<span><i style="background:var(--s1)"></i>${esc(names[1])} en fonction de ${esc(names[0])}</span>`
-      : names.map((name, j) => `<span><i style="background:var(--s${j + 1})"></i>${esc(name)}</span>`).join('');
+      : names.map((name, j) => `<span><i style="background:var(${seriesColor(j)})"></i>${esc(name)}</span>`).join('');
     const folded = collapsedPlots.has(b.id);
     return `<section class="plot-card${folded ? ' is-folded' : ''}" data-plot-id="${esc(b.id)}"><div class="plot-head"><button class="btn plot-fold" type="button" aria-expanded="${!folded}" aria-label="${folded ? 'Dérouler' : 'Replier'} ${esc(b.name)}" title="${folded ? 'Dérouler' : 'Replier'} le tracé">${folded ? '＋' : '−'}</button><span class="plot-title">${esc(b.name)}</span><div class="plot-signals">${legend}</div></div><div class="plot-content"${folded ? ' hidden' : ''}><canvas data-plot-id="${esc(b.id)}" aria-label="Tracé de ${esc(b.name)}"></canvas></div></section>`;
   }).join('') : '<p>Aucun oscilloscope ou graphe XY dans le schéma.</p>';
@@ -1113,7 +1202,7 @@ function drawPlot(id, cv) {
   const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
   const cs = getComputedStyle(document.documentElement), col = n => cs.getPropertyValue(n).trim();
   const b = byId(id), R = results[id]; g.font = '11px ' + (col('--f-mono') || 'monospace');
-  if (!b || !R || !R.T.length || R.Y.length !== nIn(b)) { plotGeoms[id] = null; g.fillStyle = col('--muted'); g.font = '13px ' + col('--f-ui'); g.textAlign = 'center'; g.fillText('Lancez la simulation pour tracer ce signal.', W / 2, H / 2); return; }
+  if (!b || !R || !R.T.length || R.Y.length !== seriesNames(b).length) { plotGeoms[id] = null; g.fillStyle = col('--muted'); g.font = '13px ' + col('--f-ui'); g.textAlign = 'center'; g.fillText('Lancez la simulation pour tracer ce signal.', W / 2, H / 2); return; }
   const L = 58, Rm = 16, T = 12, Bm = 30, pw = W - L - Rm, ph = H - T - Bm, xy = b.type === 'xy', n = R.T.length;
   let x0, x1, i0 = 0, i1 = n - 1; const X = xy ? R.Y[0] : R.T, YS = xy ? [R.Y[1]] : R.Y;
   if (xy) { x0 = Infinity; x1 = -Infinity; for (let i = 0; i < n; i++) { const v = X[i]; if (v < x0) x0 = v; if (v > x1) x1 = v; } const p = (x1 - x0) * 0.06 || 1; x0 -= p; x1 += p; }
@@ -1143,7 +1232,7 @@ function drawPlot(id, cv) {
   YS.forEach((Y, j) => {
     const panelTop = T + (stacked ? j : 0) * panelH;
     g.save(); g.beginPath(); g.rect(L, panelTop, pw, panelH); g.clip();
-    g.strokeStyle = col('--s' + (j + 1)); g.beginPath();
+    g.strokeStyle = col(seriesColor(j)); g.beginPath();
     if (!xy && i1 - i0 > 4 * pw) {
       let px = -1, mn = 0, mx = 0, last = 0, first = true;
       const flush = () => { if (px < 0) return; if (first) { g.moveTo(px, sy(mn, j)); first = false; } g.lineTo(px, sy(mn, j)); g.lineTo(px, sy(mx, j)); g.lineTo(px, sy(last, j)); };
@@ -1157,7 +1246,7 @@ function drawPlot(id, cv) {
   if (plotHover[id] != null && !xy) {
     const i = Math.min(n - 1, lowerIdx(X, plotHover[id])), k = i > 0 && plotHover[id] - X[i - 1] < X[i] - plotHover[id] ? i - 1 : i, x = sx(X[k]);
     g.strokeStyle = col('--muted'); g.lineWidth = 1; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke(); g.setLineDash([]);
-    YS.forEach((Y, j) => { g.fillStyle = col('--s' + (j + 1)); g.beginPath(); g.arc(x, sy(Y[k], j), 3.5, 0, 7); g.fill(); });
+    YS.forEach((Y, j) => { g.fillStyle = col(seriesColor(j)); g.beginPath(); g.arc(x, sy(Y[k], j), 3.5, 0, 7); g.fill(); });
     if (activePlot === id) $('read').textContent = 't = ' + fmtNum(X[k]) + ' s   ' + seriesNames(b).map((nm, j) => nm + ' = ' + fmtNum(YS[j][k])).join('   ');
   }
 }
